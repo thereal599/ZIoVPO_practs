@@ -23,4 +23,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ZiovpoApp
-          path: build/Release/ZiovpoApp.exe
+          path: build/Release/ziovpo-practs.exe

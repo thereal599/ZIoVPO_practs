@@ -4,5 +4,45 @@
 ]
 interface ZiovpoServiceControl
 {
+    typedef enum _RpcStatusCode
+    {
+        RPC_APP_OK = 0,
+        RPC_APP_NOT_AUTHENTICATED = 1,
+        RPC_APP_BAD_CREDENTIALS = 2,
+        RPC_APP_SESSION_EXPIRED = 3,
+        RPC_APP_NO_LICENSE = 10,
+        RPC_APP_LICENSE_BLOCKED = 11,
+        RPC_APP_LICENSE_EXPIRED = 12,
+        RPC_APP_INVALID_ACTIVATION_KEY = 13,
+        RPC_APP_LICENSE_OWNED_BY_ANOTHER_USER = 14,
+        RPC_APP_DEVICE_OWNED_BY_ANOTHER_USER = 15,
+        RPC_APP_DEVICE_LIMIT_REACHED = 16,
+        RPC_APP_SERVER_ERROR = 100,
+        RPC_APP_NETWORK_ERROR = 101
+    } RpcStatusCode;
+
+    typedef struct _RpcUserInfo
+    {
+        int authenticated;
+        [string] wchar_t* username;
+        int statusCode;
+        [string] wchar_t* message;
+    } RpcUserInfo;
+
+    typedef struct _RpcLicenseInfo
+    {
+        int hasLicense;
+        int active;
+        int blocked;
+        [string] wchar_t* expirationDate;
+        int statusCode;
+        [string] wchar_t* message;
+    } RpcLicenseInfo;
+
     void StopService();
+    void GetCurrentUser([out] RpcUserInfo* info);
+    int Login([in, string] wchar_t* username, [in, string] wchar_t* password, [out, string] wchar_t** errorMessage);
+    void Logout();
+    void GetLicenseInfo([out] RpcLicenseInfo* info);
+    int ActivateLicense([in, string] wchar_t* activationKey, [out, string] wchar_t** errorMessage);
 }

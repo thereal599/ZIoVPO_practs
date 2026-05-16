@@ -5,6 +5,8 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <strsafe.h>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <rpc.h>
 #include <string>
 #include <vector>
@@ -13,6 +15,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 constexpr wchar_t WINDOW_CLASS_NAME[] = L"ZiovpoWindowClass";
 constexpr wchar_t WINDOW_TITLE[] = L"ziovpo app";
@@ -28,6 +31,13 @@ constexpr UINT ID_MENU_LOGOUT = 2002;
 constexpr UINT ID_LOGIN_BUTTON = 3001;
 constexpr UINT ID_ACTIVATE_BUTTON = 3002;
 constexpr UINT ID_AV_BUTTON = 3004;
+constexpr UINT ID_SCAN_DIR_BUTTON = 3005;
+constexpr UINT ID_SCAN_FIXED_BUTTON = 3006;
+constexpr UINT ID_SCHEDULE_DIR_BUTTON = 3007;
+constexpr UINT ID_SCHEDULE_FIXED_BUTTON = 3008;
+constexpr UINT ID_SCHEDULE_OFF_BUTTON = 3009;
+constexpr UINT ID_MONITOR_DIR_BUTTON = 3010;
+constexpr UINT ID_MONITOR_OFF_BUTTON = 3011;
 constexpr UINT ID_TIMER_REFRESH = 4001;
 
 HINSTANCE g_hInstance = nullptr;
@@ -40,6 +50,7 @@ NOTIFYICONDATAW g_nid{};
 HWND g_statusLabel = nullptr;
 HWND g_userLabel = nullptr;
 HWND g_licenseLabel = nullptr;
+HWND g_dbLabel = nullptr;
 HWND g_loginTitle = nullptr;
 HWND g_loginUserLabel = nullptr;
 HWND g_loginPassLabel = nullptr;
@@ -51,6 +62,15 @@ HWND g_activationCodeLabel = nullptr;
 HWND g_activationEdit = nullptr;
 HWND g_activationButton = nullptr;
 HWND g_avButton = nullptr;
+HWND g_scanDirButton = nullptr;
+HWND g_scanFixedButton = nullptr;
+HWND g_scheduleLabel = nullptr;
+HWND g_scheduleDirButton = nullptr;
+HWND g_scheduleFixedButton = nullptr;
+HWND g_scheduleOffButton = nullptr;
+HWND g_monitorLabel = nullptr;
+HWND g_monitorDirButton = nullptr;
+HWND g_monitorOffButton = nullptr;
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void RefreshGuiState();
@@ -71,6 +91,15 @@ std::wstring RpcStringToWString(wchar_t* s)
     std::wstring out = s;
     midl_user_free(s);
     return out;
+}
+
+wchar_t* RpcAllocString(const std::wstring& s)
+{
+    size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    wchar_t* p = static_cast<wchar_t*>(midl_user_allocate(bytes));
+    if (!p) return nullptr;
+    wcscpy_s(p, s.size() + 1, s.c_str());
+    return p;
 }
 
 bool CreateRpcBinding(RPC_BINDING_HANDLE* binding)
@@ -220,7 +249,7 @@ HWND CreateEdit(HWND parent, int x, int y, int w, int h, bool password = false)
 
 HWND CreateButton(HWND parent, const wchar_t* text, UINT id, int x, int y, int w, int h)
 {
-    return CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, parent, reinterpret_cast<HMENU>(id), g_hInstance, nullptr);
+    return CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id)), g_hInstance, nullptr);
 }
 
 void CreateAppControls(HWND hwnd)
@@ -228,20 +257,32 @@ void CreateAppControls(HWND hwnd)
     g_statusLabel = CreateLabel(hwnd, L"Статус: загрузка...", 20, 20, 640, 24);
     g_userLabel = CreateLabel(hwnd, L"Пользователь: -", 20, 50, 640, 24);
     g_licenseLabel = CreateLabel(hwnd, L"Лицензия: -", 20, 80, 640, 24);
+    g_dbLabel = CreateLabel(hwnd, L"Антивирусные базы: -", 20, 110, 640, 24);
 
-    g_loginTitle = CreateLabel(hwnd, L"Вход в учетную запись", 20, 125, 300, 24);
-    g_loginUserLabel = CreateLabel(hwnd, L"Логин:", 20, 155, 90, 22);
-    g_userEdit = CreateEdit(hwnd, 120, 152, 220, 24);
-    g_loginPassLabel = CreateLabel(hwnd, L"Пароль:", 20, 185, 90, 22);
-    g_passEdit = CreateEdit(hwnd, 120, 182, 220, 24, true);
-    g_loginButton = CreateButton(hwnd, L"Войти", ID_LOGIN_BUTTON, 120, 218, 110, 30);
+    g_loginTitle = CreateLabel(hwnd, L"Вход в учетную запись", 20, 150, 300, 24);
+    g_loginUserLabel = CreateLabel(hwnd, L"Логин:", 20, 180, 90, 22);
+    g_userEdit = CreateEdit(hwnd, 120, 177, 220, 24);
+    g_loginPassLabel = CreateLabel(hwnd, L"Пароль:", 20, 210, 90, 22);
+    g_passEdit = CreateEdit(hwnd, 120, 207, 220, 24, true);
+    g_loginButton = CreateButton(hwnd, L"Войти", ID_LOGIN_BUTTON, 120, 243, 110, 30);
 
-    g_activationTitle = CreateLabel(hwnd, L"Активация продукта", 20, 270, 300, 24);
-    g_activationCodeLabel = CreateLabel(hwnd, L"Код:", 20, 300, 90, 22);
-    g_activationEdit = CreateEdit(hwnd, 120, 297, 330, 24);
-    g_activationButton = CreateButton(hwnd, L"Активировать", ID_ACTIVATE_BUTTON, 120, 333, 140, 30);
+    g_activationTitle = CreateLabel(hwnd, L"Активация продукта", 20, 300, 300, 24);
+    g_activationCodeLabel = CreateLabel(hwnd, L"Код:", 20, 330, 90, 22);
+    g_activationEdit = CreateEdit(hwnd, 120, 327, 330, 24);
+    g_activationButton = CreateButton(hwnd, L"Активировать", ID_ACTIVATE_BUTTON, 120, 363, 140, 30);
 
-    g_avButton = CreateButton(hwnd, L"Запустить проверку", ID_AV_BUTTON, 20, 400, 180, 34);
+    g_avButton = CreateButton(hwnd, L"Сканировать файл", ID_AV_BUTTON, 20, 430, 180, 34);
+    g_scanDirButton = CreateButton(hwnd, L"Сканировать папку", ID_SCAN_DIR_BUTTON, 220, 430, 190, 34);
+    g_scanFixedButton = CreateButton(hwnd, L"Все несъемные диски", ID_SCAN_FIXED_BUTTON, 430, 430, 220, 34);
+
+    g_scheduleLabel = CreateLabel(hwnd, L"Расписание: -", 20, 480, 700, 24);
+    g_scheduleDirButton = CreateButton(hwnd, L"Расписание: папка", ID_SCHEDULE_DIR_BUTTON, 20, 510, 180, 30);
+    g_scheduleFixedButton = CreateButton(hwnd, L"Расписание: диски", ID_SCHEDULE_FIXED_BUTTON, 220, 510, 180, 30);
+    g_scheduleOffButton = CreateButton(hwnd, L"Откл. расписание", ID_SCHEDULE_OFF_BUTTON, 420, 510, 180, 30);
+
+    g_monitorLabel = CreateLabel(hwnd, L"Мониторинг: -", 20, 555, 700, 24);
+    g_monitorDirButton = CreateButton(hwnd, L"Мониторинг папки", ID_MONITOR_DIR_BUTTON, 20, 585, 180, 30);
+    g_monitorOffButton = CreateButton(hwnd, L"Откл. мониторинг", ID_MONITOR_OFF_BUTTON, 220, 585, 180, 30);
 }
 
 void ShowControl(HWND h, bool show)
@@ -266,6 +307,13 @@ std::wstring GetControlText(HWND h)
 void SetAntivirusLocked(bool locked)
 {
     EnableWindow(g_avButton, locked ? FALSE : TRUE);
+    EnableWindow(g_scanDirButton, locked ? FALSE : TRUE);
+    EnableWindow(g_scanFixedButton, locked ? FALSE : TRUE);
+    EnableWindow(g_scheduleDirButton, locked ? FALSE : TRUE);
+    EnableWindow(g_scheduleFixedButton, locked ? FALSE : TRUE);
+    EnableWindow(g_scheduleOffButton, locked ? FALSE : TRUE);
+    EnableWindow(g_monitorDirButton, locked ? FALSE : TRUE);
+    EnableWindow(g_monitorOffButton, locked ? FALSE : TRUE);
 }
 
 void ShowLoginForm(bool show)
@@ -329,6 +377,20 @@ bool RpcCallGetLicenseInfo(RPC_BINDING_HANDLE binding, RpcLicenseInfo* info)
     return ok;
 }
 
+bool RpcCallGetAvDatabaseInfo(RPC_BINDING_HANDLE binding, RpcAvDatabaseInfo* info)
+{
+    bool ok = true;
+    __try
+    {
+        GetAvDatabaseInfo(binding, info);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+    }
+    return ok;
+}
+
 int RpcCallLogin(RPC_BINDING_HANDLE binding, wchar_t* username, wchar_t* password, wchar_t** errorMessage)
 {
     int status = RPC_APP_SERVER_ERROR;
@@ -368,6 +430,104 @@ int RpcCallActivateLicense(RPC_BINDING_HANDLE binding, wchar_t* activationKey, w
     return status;
 }
 
+int RpcCallScanFile(RPC_BINDING_HANDLE binding, wchar_t* path, RpcScanResult* result)
+{
+    int status = RPC_APP_SERVER_ERROR;
+    __try
+    {
+        status = ScanFile(binding, path, result);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = RPC_APP_NETWORK_ERROR;
+    }
+    return status;
+}
+
+int RpcCallScanDirectory(RPC_BINDING_HANDLE binding, wchar_t* path, RpcScanResult* result)
+{
+    int status = RPC_APP_SERVER_ERROR;
+    __try
+    {
+        status = ScanDirectory(binding, path, result);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = RPC_APP_NETWORK_ERROR;
+    }
+    return status;
+}
+
+int RpcCallScanFixedDrives(RPC_BINDING_HANDLE binding, RpcScanResult* result)
+{
+    int status = RPC_APP_SERVER_ERROR;
+    __try
+    {
+        status = ScanFixedDrives(binding, result);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = RPC_APP_NETWORK_ERROR;
+    }
+    return status;
+}
+
+int RpcCallConfigureScheduledScan(RPC_BINDING_HANDLE binding, int enabled, int intervalMinutes, int scanFixedDrives, wchar_t* path)
+{
+    int status = RPC_APP_SERVER_ERROR;
+    __try
+    {
+        status = ConfigureScheduledScan(binding, enabled, intervalMinutes, scanFixedDrives, path);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = RPC_APP_NETWORK_ERROR;
+    }
+    return status;
+}
+
+bool RpcCallGetScheduledScanInfo(RPC_BINDING_HANDLE binding, RpcScheduledScanInfo* info)
+{
+    bool ok = true;
+    __try
+    {
+        GetScheduledScanInfo(binding, info);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+    }
+    return ok;
+}
+
+int RpcCallConfigureDirectoryMonitor(RPC_BINDING_HANDLE binding, int enabled, wchar_t* path)
+{
+    int status = RPC_APP_SERVER_ERROR;
+    __try
+    {
+        status = ConfigureDirectoryMonitor(binding, enabled, path);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = RPC_APP_NETWORK_ERROR;
+    }
+    return status;
+}
+
+bool RpcCallGetDirectoryMonitorInfo(RPC_BINDING_HANDLE binding, RpcDirectoryMonitorInfo* info)
+{
+    bool ok = true;
+    __try
+    {
+        GetDirectoryMonitorInfo(binding, info);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = false;
+    }
+    return ok;
+}
+
 bool StopServiceViaRpc()
 {
     RPC_BINDING_HANDLE binding = nullptr;
@@ -398,6 +558,18 @@ bool GetLicenseInfoViaRpc(RpcLicenseInfo& info)
     if (!CreateRpcBinding(&binding)) return false;
 
     bool ok = RpcCallGetLicenseInfo(binding, &info);
+
+    FreeRpcBinding(binding);
+    return ok;
+}
+
+bool GetAvDatabaseInfoViaRpc(RpcAvDatabaseInfo& info)
+{
+    ZeroMemory(&info, sizeof(info));
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding)) return false;
+
+    bool ok = RpcCallGetAvDatabaseInfo(binding, &info);
 
     FreeRpcBinding(binding);
     return ok;
@@ -456,6 +628,121 @@ int ActivateLicenseViaRpc(const std::wstring& key, std::wstring& error)
     return status;
 }
 
+int ScanFileViaRpc(const std::wstring& path, RpcScanResult& result)
+{
+    ZeroMemory(&result, sizeof(result));
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        result.statusCode = RPC_APP_NETWORK_ERROR;
+        result.message = RpcAllocString(L"Не удалось подключиться к службе");
+        return RPC_APP_NETWORK_ERROR;
+    }
+
+    int status = RpcCallScanFile(
+        binding,
+        const_cast<wchar_t*>(path.c_str()),
+        &result
+    );
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+int ScanDirectoryViaRpc(const std::wstring& path, RpcScanResult& result)
+{
+    ZeroMemory(&result, sizeof(result));
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        result.statusCode = RPC_APP_NETWORK_ERROR;
+        result.message = RpcAllocString(L"Не удалось подключиться к службе");
+        return RPC_APP_NETWORK_ERROR;
+    }
+
+    int status = RpcCallScanDirectory(
+        binding,
+        const_cast<wchar_t*>(path.c_str()),
+        &result
+    );
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+int ScanFixedDrivesViaRpc(RpcScanResult& result)
+{
+    ZeroMemory(&result, sizeof(result));
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding))
+    {
+        result.statusCode = RPC_APP_NETWORK_ERROR;
+        result.message = RpcAllocString(L"Не удалось подключиться к службе");
+        return RPC_APP_NETWORK_ERROR;
+    }
+
+    int status = RpcCallScanFixedDrives(binding, &result);
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+int ConfigureScheduledScanViaRpc(bool enabled, int intervalMinutes, bool scanFixedDrives, const std::wstring& path)
+{
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding)) return RPC_APP_NETWORK_ERROR;
+
+    int status = RpcCallConfigureScheduledScan(
+        binding,
+        enabled ? 1 : 0,
+        intervalMinutes,
+        scanFixedDrives ? 1 : 0,
+        const_cast<wchar_t*>(path.c_str())
+    );
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+bool GetScheduledScanInfoViaRpc(RpcScheduledScanInfo& info)
+{
+    ZeroMemory(&info, sizeof(info));
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding)) return false;
+
+    bool ok = RpcCallGetScheduledScanInfo(binding, &info);
+
+    FreeRpcBinding(binding);
+    return ok;
+}
+
+int ConfigureDirectoryMonitorViaRpc(bool enabled, const std::wstring& path)
+{
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding)) return RPC_APP_NETWORK_ERROR;
+
+    int status = RpcCallConfigureDirectoryMonitor(
+        binding,
+        enabled ? 1 : 0,
+        const_cast<wchar_t*>(path.c_str())
+    );
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+bool GetDirectoryMonitorInfoViaRpc(RpcDirectoryMonitorInfo& info)
+{
+    ZeroMemory(&info, sizeof(info));
+    RPC_BINDING_HANDLE binding = nullptr;
+    if (!CreateRpcBinding(&binding)) return false;
+
+    bool ok = RpcCallGetDirectoryMonitorInfo(binding, &info);
+
+    FreeRpcBinding(binding);
+    return ok;
+}
+
 void FreeUserInfo(RpcUserInfo& info)
 {
     if (info.username) midl_user_free(info.username);
@@ -470,6 +757,161 @@ void FreeLicenseInfo(RpcLicenseInfo& info)
     ZeroMemory(&info, sizeof(info));
 }
 
+void FreeAvDatabaseInfo(RpcAvDatabaseInfo& info)
+{
+    if (info.releaseDate) midl_user_free(info.releaseDate);
+    if (info.message) midl_user_free(info.message);
+    ZeroMemory(&info, sizeof(info));
+}
+
+void FreeScanResult(RpcScanResult& result)
+{
+    if (result.objectPath) midl_user_free(result.objectPath);
+    if (result.threatName) midl_user_free(result.threatName);
+    if (result.message) midl_user_free(result.message);
+    ZeroMemory(&result, sizeof(result));
+}
+
+void FreeScheduledScanInfo(RpcScheduledScanInfo& info)
+{
+    if (info.path) midl_user_free(info.path);
+    if (info.lastRunTime) midl_user_free(info.lastRunTime);
+    if (info.lastMessage) midl_user_free(info.lastMessage);
+    ZeroMemory(&info, sizeof(info));
+}
+
+void FreeDirectoryMonitorInfo(RpcDirectoryMonitorInfo& info)
+{
+    if (info.path) midl_user_free(info.path);
+    if (info.lastEventTime) midl_user_free(info.lastEventTime);
+    if (info.lastMessage) midl_user_free(info.lastMessage);
+    ZeroMemory(&info, sizeof(info));
+}
+
+std::wstring SelectFileForScan(HWND hwnd)
+{
+    wchar_t path[MAX_PATH]{};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = ARRAYSIZE(path);
+    ofn.lpstrTitle = L"Выберите файл для сканирования";
+    ofn.lpstrFilter = L"Все файлы\0*.*\0";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+
+    return GetOpenFileNameW(&ofn) ? std::wstring(path) : L"";
+}
+
+std::wstring SelectFolderForScan(HWND hwnd)
+{
+    BROWSEINFOW bi{};
+    bi.hwndOwner = hwnd;
+    bi.lpszTitle = L"Выберите папку для сканирования";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return L"";
+
+    wchar_t path[MAX_PATH]{};
+    bool ok = SHGetPathFromIDListW(pidl, path) == TRUE;
+    CoTaskMemFree(pidl);
+    return ok ? std::wstring(path) : L"";
+}
+
+void ShowScanResult(HWND hwnd, const wchar_t* title, RpcScanResult& result)
+{
+    std::wstring message = result.message ? result.message : L"";
+    if (message.empty())
+        message = result.statusCode == RPC_APP_OK ? L"Сканирование завершено" : L"Ошибка сканирования";
+
+    UINT icon = result.infected ? MB_ICONWARNING : (result.statusCode == RPC_APP_OK ? MB_ICONINFORMATION : MB_ICONERROR);
+    MessageBoxW(hwnd, message.c_str(), title, MB_OK | icon);
+}
+
+void RefreshDatabaseLabel()
+{
+    RpcAvDatabaseInfo db{};
+    if (!GetAvDatabaseInfoViaRpc(db))
+    {
+        SetLabel(g_dbLabel, L"Антивирусные базы: нет связи со службой");
+        return;
+    }
+
+    std::wstring releaseDate = db.releaseDate ? db.releaseDate : L"";
+    std::wstring message = db.message ? db.message : L"";
+
+    if (db.loaded)
+    {
+        SetLabel(
+            g_dbLabel,
+            L"Антивирусные базы: " + releaseDate + L", записей: " + std::to_wstring(db.recordCount));
+    }
+    else
+    {
+        SetLabel(g_dbLabel, L"Антивирусные базы: " + (message.empty() ? L"не загружены" : message));
+    }
+
+    FreeAvDatabaseInfo(db);
+}
+
+void RefreshOptionalFeatureLabels()
+{
+    RpcScheduledScanInfo schedule{};
+    if (GetScheduledScanInfoViaRpc(schedule))
+    {
+        std::wstring path = schedule.path ? schedule.path : L"";
+        std::wstring lastRun = schedule.lastRunTime ? schedule.lastRunTime : L"";
+        std::wstring target = schedule.scanFixedDrives ? L"все несъемные диски" : path;
+
+        if (schedule.enabled)
+        {
+            std::wstring text = L"Расписание: каждые " + std::to_wstring(schedule.intervalMinutes) +
+                L" мин., " + target;
+            if (!lastRun.empty())
+                text += L"; последний запуск: " + lastRun +
+                    L", угроз: " + std::to_wstring(schedule.lastThreatsFound);
+            SetLabel(g_scheduleLabel, text);
+        }
+        else
+        {
+            SetLabel(g_scheduleLabel, L"Расписание: выключено");
+        }
+
+        FreeScheduledScanInfo(schedule);
+    }
+    else
+    {
+        SetLabel(g_scheduleLabel, L"Расписание: нет связи со службой");
+    }
+
+    RpcDirectoryMonitorInfo monitor{};
+    if (GetDirectoryMonitorInfoViaRpc(monitor))
+    {
+        std::wstring path = monitor.path ? monitor.path : L"";
+        std::wstring lastEvent = monitor.lastEventTime ? monitor.lastEventTime : L"";
+
+        if (monitor.enabled)
+        {
+            std::wstring text = L"Мониторинг: " + path;
+            if (!lastEvent.empty())
+                text += L"; последнее событие: " + lastEvent +
+                    L", угроз: " + std::to_wstring(monitor.lastThreatsFound);
+            SetLabel(g_monitorLabel, text);
+        }
+        else
+        {
+            SetLabel(g_monitorLabel, L"Мониторинг: выключен");
+        }
+
+        FreeDirectoryMonitorInfo(monitor);
+    }
+    else
+    {
+        SetLabel(g_monitorLabel, L"Мониторинг: нет связи со службой");
+    }
+}
+
 void RefreshGuiState()
 {
     RpcUserInfo user{};
@@ -478,6 +920,9 @@ void RefreshGuiState()
         SetLabel(g_statusLabel, L"Статус: нет связи со службой");
         SetLabel(g_userLabel, L"Пользователь: -");
         SetLabel(g_licenseLabel, L"Лицензия: -");
+        SetLabel(g_dbLabel, L"Антивирусные базы: -");
+        SetLabel(g_scheduleLabel, L"Расписание: -");
+        SetLabel(g_monitorLabel, L"Мониторинг: -");
         ShowLoginForm(true);
         ShowActivationForm(false);
         SetAntivirusLocked(true);
@@ -493,6 +938,9 @@ void RefreshGuiState()
         SetLabel(g_statusLabel, L"Статус: требуется вход");
         SetLabel(g_userLabel, L"Пользователь: -");
         SetLabel(g_licenseLabel, L"Лицензия: отсутствует");
+        SetLabel(g_dbLabel, L"Антивирусные базы: требуется вход");
+        SetLabel(g_scheduleLabel, L"Расписание: требуется вход");
+        SetLabel(g_monitorLabel, L"Мониторинг: требуется вход");
         ShowLoginForm(true);
         ShowActivationForm(false);
         SetAntivirusLocked(true);
@@ -507,6 +955,9 @@ void RefreshGuiState()
     {
         SetLabel(g_statusLabel, L"Статус: ошибка запроса лицензии");
         SetLabel(g_licenseLabel, L"Лицензия: неизвестно");
+        SetLabel(g_dbLabel, L"Антивирусные базы: недоступны");
+        SetLabel(g_scheduleLabel, L"Расписание: недоступно");
+        SetLabel(g_monitorLabel, L"Мониторинг: недоступен");
         ShowActivationForm(true);
         SetAntivirusLocked(true);
         return;
@@ -523,6 +974,8 @@ void RefreshGuiState()
     {
         SetLabel(g_statusLabel, L"Статус: антивирус разблокирован");
         SetLabel(g_licenseLabel, L"Лицензия активна до: " + exp);
+        RefreshDatabaseLabel();
+        RefreshOptionalFeatureLabels();
         ShowActivationForm(false);
         SetAntivirusLocked(false);
     }
@@ -560,6 +1013,9 @@ void RefreshGuiState()
         }
 
         ShowActivationForm(true);
+        SetLabel(g_dbLabel, L"Антивирусные базы: нужна активная лицензия");
+        SetLabel(g_scheduleLabel, L"Расписание: нужна активная лицензия");
+        SetLabel(g_monitorLabel, L"Мониторинг: нужна активная лицензия");
         SetAntivirusLocked(true);
     }
 }
@@ -585,8 +1041,8 @@ bool CreateMainWindow(HINSTANCE hInstance)
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        720,
-        520,
+        760,
+        680,
         nullptr,
         nullptr,
         hInstance,
@@ -722,8 +1178,104 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case ID_AV_BUTTON:
-            MessageBoxW(hwnd, L"Проверка запущена. Это демонстрационная функция антивируса.", L"Антивирус", MB_OK | MB_ICONINFORMATION);
+        {
+            std::wstring path = SelectFileForScan(hwnd);
+            if (path.empty()) return 0;
+
+            RpcScanResult result{};
+            ScanFileViaRpc(path, result);
+            ShowScanResult(hwnd, L"Сканирование файла", result);
+            FreeScanResult(result);
+            RefreshGuiState();
             return 0;
+        }
+
+        case ID_SCAN_DIR_BUTTON:
+        {
+            std::wstring path = SelectFolderForScan(hwnd);
+            if (path.empty()) return 0;
+
+            RpcScanResult result{};
+            ScanDirectoryViaRpc(path, result);
+            ShowScanResult(hwnd, L"Сканирование папки", result);
+            FreeScanResult(result);
+            RefreshGuiState();
+            return 0;
+        }
+
+        case ID_SCAN_FIXED_BUTTON:
+        {
+            if (MessageBoxW(hwnd, L"Сканирование всех несъемных дисков может занять много времени. Запустить?", L"Сканирование дисков", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                return 0;
+
+            RpcScanResult result{};
+            ScanFixedDrivesViaRpc(result);
+            ShowScanResult(hwnd, L"Сканирование дисков", result);
+            FreeScanResult(result);
+            RefreshGuiState();
+            return 0;
+        }
+
+        case ID_SCHEDULE_DIR_BUTTON:
+        {
+            std::wstring path = SelectFolderForScan(hwnd);
+            if (path.empty()) return 0;
+
+            int status = ConfigureScheduledScanViaRpc(true, 1, false, path);
+            MessageBoxW(hwnd,
+                status == RPC_APP_OK ? L"Сканирование папки по расписанию включено. Интервал: 1 минута." : L"Не удалось включить расписание.",
+                L"Расписание",
+                MB_OK | (status == RPC_APP_OK ? MB_ICONINFORMATION : MB_ICONERROR));
+            RefreshGuiState();
+            return 0;
+        }
+
+        case ID_SCHEDULE_FIXED_BUTTON:
+        {
+            int status = ConfigureScheduledScanViaRpc(true, 1, true, L"");
+            MessageBoxW(hwnd,
+                status == RPC_APP_OK ? L"Сканирование всех несъемных дисков по расписанию включено. Интервал: 1 минута." : L"Не удалось включить расписание.",
+                L"Расписание",
+                MB_OK | (status == RPC_APP_OK ? MB_ICONINFORMATION : MB_ICONERROR));
+            RefreshGuiState();
+            return 0;
+        }
+
+        case ID_SCHEDULE_OFF_BUTTON:
+        {
+            int status = ConfigureScheduledScanViaRpc(false, 1, false, L"");
+            MessageBoxW(hwnd,
+                status == RPC_APP_OK ? L"Сканирование по расписанию отключено." : L"Не удалось отключить расписание.",
+                L"Расписание",
+                MB_OK | (status == RPC_APP_OK ? MB_ICONINFORMATION : MB_ICONERROR));
+            RefreshGuiState();
+            return 0;
+        }
+
+        case ID_MONITOR_DIR_BUTTON:
+        {
+            std::wstring path = SelectFolderForScan(hwnd);
+            if (path.empty()) return 0;
+
+            int status = ConfigureDirectoryMonitorViaRpc(true, path);
+            MessageBoxW(hwnd,
+                status == RPC_APP_OK ? L"Мониторинг папки включен." : L"Не удалось включить мониторинг.",
+                L"Мониторинг",
+                MB_OK | (status == RPC_APP_OK ? MB_ICONINFORMATION : MB_ICONERROR));
+            RefreshGuiState();
+            return 0;
+        }
+
+        case ID_MONITOR_OFF_BUTTON:
+        {
+            int status = ConfigureDirectoryMonitorViaRpc(false, L"");
+            MessageBoxW(hwnd,
+                status == RPC_APP_OK ? L"Мониторинг папки отключен." : L"Не удалось отключить мониторинг.",
+                L"Мониторинг",
+                MB_OK | (status == RPC_APP_OK ? MB_ICONINFORMATION : MB_ICONERROR));
+            RefreshGuiState();
+            return 0;
+        }
 
         case ID_TRAY_EXIT:
         case ID_MENU_FILE_EXIT:

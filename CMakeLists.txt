@@ -39,7 +39,7 @@ add_executable(ziovpo-practs WIN32
 add_dependencies(ziovpo-practs generate_rpc)
 target_include_directories(ziovpo-practs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${RPC_GEN_DIR}")
 target_compile_definitions(ziovpo-practs PRIVATE UNICODE _UNICODE)
-target_link_libraries(ziovpo-practs PRIVATE user32 shell32 advapi32 rpcrt4)
+target_link_libraries(ziovpo-practs PRIVATE user32 shell32 advapi32 rpcrt4 comdlg32 ole32)
 
 add_executable(ziovpo-practs-service
     "ziovpo-service.cpp"
@@ -50,4 +50,4 @@ add_executable(ziovpo-practs-service
 add_dependencies(ziovpo-practs-service generate_rpc)
 target_include_directories(ziovpo-practs-service PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${RPC_GEN_DIR}")
 target_compile_definitions(ziovpo-practs-service PRIVATE UNICODE _UNICODE)
-target_link_libraries(ziovpo-practs-service PRIVATE advapi32 rpcrt4 wtsapi32 userenv winhttp iphlpapi)
+target_link_libraries(ziovpo-practs-service PRIVATE advapi32 rpcrt4 wtsapi32 userenv winhttp iphlpapi bcrypt)

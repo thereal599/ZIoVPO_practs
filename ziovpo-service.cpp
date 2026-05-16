@@ -14,9 +14,12 @@
 #include <rpc.h>
 #include <winhttp.h>
 #include <iphlpapi.h>
+#include <bcrypt.h>
 
 #include <vector>
 #include <string>
+#include <map>
+#include <array>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -24,6 +27,12 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <fstream>
+#include <filesystem>
+#include <queue>
+#include <cstdint>
+#include <cctype>
+#include <cwctype>
 #include <cstdio>
 
 #pragma comment(lib, "wtsapi32.lib")
@@ -32,6 +41,7 @@
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 void* __RPC_USER midl_user_allocate(size_t size) { return malloc(size); }
 void __RPC_USER midl_user_free(void* p) { free(p); }
@@ -75,6 +85,50 @@ struct AppState
 };
 
 AppState g_app;
+
+enum class AvObjectType : unsigned int
+{
+    Unknown = 0,
+    PE = 1,
+    PythonScript = 2
+};
+
+struct AvSignatureRecord
+{
+    unsigned long long objectSignaturePrefix = 0;
+    unsigned int objectSignatureLength = 0;
+    std::vector<BYTE> objectSignature;
+    unsigned long long offsetBegin = 0;
+    unsigned long long offsetEnd = 0;
+    AvObjectType objectType = AvObjectType::Unknown;
+    std::vector<BYTE> avRecordSignature;
+    std::wstring threatName;
+};
+
+struct AvDatabaseState
+{
+    std::mutex mutex;
+    std::map<unsigned long long, std::vector<AvSignatureRecord>> records;
+    bool loaded = false;
+    int recordCount = 0;
+    std::wstring releaseDate;
+    int statusCode = RPC_APP_AV_DATABASE_NOT_LOADED;
+    std::wstring message = L"Антивирусные базы не загружены";
+};
+
+AvDatabaseState g_avDb;
+
+struct AhoNode
+{
+    std::array<int, 256> next;
+    int fail = 0;
+    std::vector<unsigned long long> outputs;
+
+    AhoNode()
+    {
+        next.fill(-1);
+    }
+};
 
 void SetSvcStatus(DWORD state, DWORD controlsAccepted = 0, DWORD win32ExitCode = NO_ERROR)
 {
@@ -469,6 +523,113 @@ HttpResponse HttpPostJson(const wchar_t* path, const std::string& body, const st
     return result;
 }
 
+HttpResponse HttpGetJson(const wchar_t* path, const std::string& bearerToken = "", const wchar_t* host = kApiHost)
+{
+    HttpResponse result;
+
+    HINTERNET hSession = WinHttpOpen(
+        L"ziovpo-service/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0);
+    if (!hSession)
+    {
+        result.winError = GetLastError();
+        return result;
+    }
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host, kApiPort, 0);
+    if (!hConnect)
+    {
+        result.winError = GetLastError();
+        WinHttpCloseHandle(hSession);
+        return result;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect,
+        L"GET",
+        path,
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hRequest)
+    {
+        result.winError = GetLastError();
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return result;
+    }
+
+    DWORD securityFlags =
+        SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+        SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+        SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+
+    WinHttpSetOption(
+        hRequest,
+        WINHTTP_OPTION_SECURITY_FLAGS,
+        &securityFlags,
+        sizeof(securityFlags));
+
+    std::wstring headers = L"Accept: application/json\r\n";
+    if (!bearerToken.empty())
+    {
+        headers += L"Authorization: Bearer ";
+        headers += Utf8ToWide(bearerToken);
+        headers += L"\r\n";
+    }
+
+    BOOL ok = WinHttpSendRequest(
+        hRequest,
+        headers.c_str(),
+        static_cast<DWORD>(headers.size()),
+        WINHTTP_NO_REQUEST_DATA,
+        0,
+        0,
+        0);
+
+    if (!ok || !WinHttpReceiveResponse(hRequest, nullptr))
+    {
+        result.winError = GetLastError();
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return result;
+    }
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX))
+    {
+        result.status = status;
+    }
+
+    DWORD available = 0;
+    do
+    {
+        available = 0;
+        if (!WinHttpQueryDataAvailable(hRequest, &available)) break;
+        if (available == 0) break;
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!WinHttpReadData(hRequest, chunk.data(), available, &read)) break;
+        chunk.resize(read);
+        result.body += chunk;
+    } while (available > 0);
+
+    result.transportOk = true;
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
 std::wstring ExtractServerMessage(const std::string& body)
 {
     std::string msg = ExtractJsonString(body, "error");
@@ -476,6 +637,934 @@ std::wstring ExtractServerMessage(const std::string& body)
     if (msg.empty()) msg = UnquoteJsonString(body);
     if (msg.empty()) msg = "Server error";
     return Utf8ToWide(msg);
+}
+
+std::wstring ToLowerW(std::wstring value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+    return value;
+}
+
+int HexDigit(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+bool HexToBytes(const std::string& hex, std::vector<BYTE>& bytes)
+{
+    std::string clean;
+    clean.reserve(hex.size());
+    for (char c : hex)
+    {
+        if (!isspace(static_cast<unsigned char>(c)))
+            clean.push_back(c);
+    }
+
+    if (clean.size() % 2 != 0) return false;
+
+    std::vector<BYTE> out;
+    out.reserve(clean.size() / 2);
+    for (size_t i = 0; i < clean.size(); i += 2)
+    {
+        int hi = HexDigit(clean[i]);
+        int lo = HexDigit(clean[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back(static_cast<BYTE>((hi << 4) | lo));
+    }
+
+    bytes = std::move(out);
+    return true;
+}
+
+unsigned long long PrefixFromBytes(const BYTE* bytes)
+{
+    unsigned long long prefix = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        prefix = (prefix << 8) | bytes[i];
+    }
+    return prefix;
+}
+
+std::array<BYTE, 8> BytesFromPrefix(unsigned long long prefix)
+{
+    std::array<BYTE, 8> bytes{};
+    for (int i = 7; i >= 0; --i)
+    {
+        bytes[i] = static_cast<BYTE>(prefix & 0xFF);
+        prefix >>= 8;
+    }
+    return bytes;
+}
+
+AvObjectType ParseAvObjectType(const std::string& value)
+{
+    std::string upper = value;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+        [](unsigned char c) { return static_cast<char>(toupper(c)); });
+
+    if (upper == "PE" || upper == "PORTABLE_EXECUTABLE") return AvObjectType::PE;
+    if (upper == "PY" || upper == "PYTHON" || upper == "PYTHON_SCRIPT" || upper == "PYTHONSCRIPT")
+        return AvObjectType::PythonScript;
+
+    return AvObjectType::Unknown;
+}
+
+std::wstring AvObjectTypeName(AvObjectType type)
+{
+    switch (type)
+    {
+    case AvObjectType::PE: return L"PE";
+    case AvObjectType::PythonScript: return L"Python Script";
+    default: return L"Unknown";
+    }
+}
+
+std::vector<std::string> SplitTopLevelJsonObjects(const std::string& json)
+{
+    std::vector<std::string> objects;
+    bool inString = false;
+    bool escape = false;
+    int depth = 0;
+    size_t objectStart = std::string::npos;
+
+    for (size_t i = 0; i < json.size(); ++i)
+    {
+        char c = json[i];
+
+        if (inString)
+        {
+            if (escape)
+            {
+                escape = false;
+            }
+            else if (c == '\\')
+            {
+                escape = true;
+            }
+            else if (c == '"')
+            {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (c == '"')
+        {
+            inString = true;
+            continue;
+        }
+
+        if (c == '{')
+        {
+            if (depth == 0) objectStart = i;
+            ++depth;
+        }
+        else if (c == '}')
+        {
+            --depth;
+            if (depth == 0 && objectStart != std::string::npos)
+            {
+                objects.push_back(json.substr(objectStart, i - objectStart + 1));
+                objectStart = std::string::npos;
+            }
+        }
+    }
+
+    return objects;
+}
+
+void SetAvDatabaseStatus(bool loaded, int recordCount, int statusCode, const std::wstring& message, const std::wstring& releaseDate = L"")
+{
+    std::lock_guard<std::mutex> lock(g_avDb.mutex);
+    if (!loaded) g_avDb.records.clear();
+    g_avDb.loaded = loaded;
+    g_avDb.recordCount = recordCount;
+    g_avDb.statusCode = statusCode;
+    g_avDb.message = message;
+    g_avDb.releaseDate = releaseDate;
+}
+
+int LoadAvDatabaseFromJson(const std::string& json)
+{
+    std::map<unsigned long long, std::vector<AvSignatureRecord>> nextRecords;
+    int recordCount = 0;
+    std::string newestUpdate;
+
+    for (const std::string& objectJson : SplitTopLevelJsonObjects(json))
+    {
+        std::string status = ExtractJsonString(objectJson, "status");
+        if (!status.empty() && status != "ACTUAL") continue;
+
+        std::vector<BYTE> firstBytes;
+        if (!HexToBytes(ExtractJsonString(objectJson, "firstBytesHex"), firstBytes) || firstBytes.size() < 8)
+            continue;
+
+        std::vector<BYTE> signatureHash;
+        if (!HexToBytes(ExtractJsonString(objectJson, "remainderHashHex"), signatureHash) || signatureHash.empty())
+            continue;
+
+        long long remainderLength = ExtractJsonInt64(objectJson, "remainderLength");
+        long long offsetStart = ExtractJsonInt64(objectJson, "offsetStart");
+        long long offsetEnd = ExtractJsonInt64(objectJson, "offsetEnd");
+        if (remainderLength < 0 || remainderLength > 0xFFFFFFFFLL - 8 || offsetStart < 0 || offsetEnd < offsetStart)
+            continue;
+
+        AvObjectType objectType = ParseAvObjectType(ExtractJsonString(objectJson, "fileType"));
+        if (objectType == AvObjectType::Unknown)
+            continue;
+
+        AvSignatureRecord record;
+        record.objectSignaturePrefix = PrefixFromBytes(firstBytes.data());
+        record.objectSignatureLength = static_cast<unsigned int>(8 + remainderLength);
+        record.objectSignature = std::move(signatureHash);
+        record.offsetBegin = static_cast<unsigned long long>(offsetStart);
+        record.offsetEnd = static_cast<unsigned long long>(offsetEnd);
+        record.objectType = objectType;
+        record.threatName = Utf8ToWide(ExtractJsonString(objectJson, "threatName"));
+        if (record.threatName.empty())
+            record.threatName = Utf8ToWide(ExtractJsonString(objectJson, "id"));
+
+        std::string signatureBytes = Base64UrlDecode(ExtractJsonString(objectJson, "digitalSignatureBase64"));
+        record.avRecordSignature.assign(signatureBytes.begin(), signatureBytes.end());
+
+        std::string updatedAt = ExtractJsonString(objectJson, "updatedAt");
+        if (updatedAt > newestUpdate) newestUpdate = updatedAt;
+
+        nextRecords[record.objectSignaturePrefix].push_back(std::move(record));
+        ++recordCount;
+    }
+
+    std::wstring releaseDate = newestUpdate.empty() ? TodayYmd() : Utf8ToWide(newestUpdate);
+
+    {
+        std::lock_guard<std::mutex> lock(g_avDb.mutex);
+        g_avDb.records = std::move(nextRecords);
+        g_avDb.loaded = true;
+        g_avDb.recordCount = recordCount;
+        g_avDb.releaseDate = releaseDate;
+        g_avDb.statusCode = RPC_APP_OK;
+        g_avDb.message = L"Антивирусные базы загружены";
+    }
+
+    return RPC_APP_OK;
+}
+
+int LoadAvDatabaseFromServer()
+{
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        if (!g_app.authenticated || !g_app.licenseActive)
+        {
+            SetAvDatabaseStatus(false, 0, RPC_APP_NO_LICENSE, L"Для загрузки баз нужна активная лицензия");
+            return RPC_APP_NO_LICENSE;
+        }
+        token = g_app.accessToken;
+    }
+
+    HttpResponse resp = HttpGetJson(L"/api/signatures", token);
+    if ((!resp.transportOk || resp.status == 404) && lstrcmpiW(kApiHost, L"localhost") != 0)
+    {
+        HttpResponse localResp = HttpGetJson(L"/api/signatures", token, L"localhost");
+        if (localResp.transportOk || !resp.transportOk)
+            resp = std::move(localResp);
+    }
+
+    if (!resp.transportOk)
+    {
+        SetAvDatabaseStatus(false, 0, RPC_APP_NETWORK_ERROR, L"Не удалось загрузить антивирусные базы: нет связи с сервером");
+        return RPC_APP_NETWORK_ERROR;
+    }
+
+    if (resp.status == 401 || resp.status == 403)
+    {
+        SetAvDatabaseStatus(false, 0, RPC_APP_SESSION_EXPIRED, L"Сессия истекла. Выполните вход снова");
+        return RPC_APP_SESSION_EXPIRED;
+    }
+
+    if (resp.status != 200)
+    {
+        SetAvDatabaseStatus(false, 0, RPC_APP_SERVER_ERROR, L"Сервер не вернул антивирусные базы: " + ExtractServerMessage(resp.body));
+        return RPC_APP_SERVER_ERROR;
+    }
+
+    return LoadAvDatabaseFromJson(resp.body);
+}
+
+bool ComputeSha256(const std::vector<BYTE>& data, std::vector<BYTE>& hash)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hashHandle = nullptr;
+    DWORD objectLength = 0;
+    DWORD hashLength = 0;
+    DWORD cbData = 0;
+
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return false;
+
+    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &cbData, 0) != 0 ||
+        BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength), &cbData, 0) != 0)
+    {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    std::vector<BYTE> hashObject(objectLength);
+    hash.assign(hashLength, 0);
+
+    if (BCryptCreateHash(alg, &hashHandle, hashObject.data(), objectLength, nullptr, 0, 0) != 0)
+    {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    NTSTATUS status = 0;
+    if (!data.empty())
+    {
+        status = BCryptHashData(hashHandle, const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()), 0);
+    }
+
+    if (status == 0)
+        status = BCryptFinishHash(hashHandle, hash.data(), hashLength, 0);
+
+    BCryptDestroyHash(hashHandle);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return status == 0;
+}
+
+bool SignatureHashMatches(const BYTE* prefixBytes, const std::vector<BYTE>& remainder, const std::vector<BYTE>& expectedHash)
+{
+    std::vector<BYTE> hash;
+    if (ComputeSha256(remainder, hash) && hash == expectedHash)
+        return true;
+
+    std::vector<BYTE> full;
+    full.reserve(8 + remainder.size());
+    full.insert(full.end(), prefixBytes, prefixBytes + 8);
+    full.insert(full.end(), remainder.begin(), remainder.end());
+
+    return ComputeSha256(full, hash) && hash == expectedHash;
+}
+
+AvObjectType DetectObjectType(const std::filesystem::path& path)
+{
+    std::wstring ext = ToLowerW(path.extension().wstring());
+    if (ext == L".py" || ext == L".pyw")
+        return AvObjectType::PythonScript;
+
+    if (ext == L".exe" || ext == L".dll" || ext == L".sys")
+        return AvObjectType::PE;
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return AvObjectType::Unknown;
+
+    char magic[2]{};
+    file.read(magic, sizeof(magic));
+    if (file.gcount() == 2 && magic[0] == 'M' && magic[1] == 'Z')
+        return AvObjectType::PE;
+
+    return AvObjectType::Unknown;
+}
+
+struct AvDatabaseSnapshot
+{
+    std::map<unsigned long long, std::vector<AvSignatureRecord>> records;
+    std::vector<AhoNode> ahoNodes;
+};
+
+std::vector<AhoNode> BuildAhoAutomaton(const std::map<unsigned long long,  std::vector<AvSignatureRecord>>& records)
+{
+    std::vector<AhoNode> nodes(1);
+
+    for (const auto& [prefix, group] : records)
+    {
+        if (group.empty()) continue;
+
+        int state = 0;
+        std::array<BYTE, 8> bytes = BytesFromPrefix(prefix);
+        for (BYTE b : bytes)
+        {
+            int& next = nodes[state].next[b];
+            if (next == -1)
+            {
+                next = static_cast<int>(nodes.size());
+                nodes.emplace_back();
+            }
+            state = next;
+        }
+        nodes[state].outputs.push_back(prefix);
+    }
+
+    std::queue<int> q;
+    for (int b = 0; b < 256; ++b)
+    {
+        int next = nodes[0].next[b];
+        if (next != -1)
+        {
+            nodes[next].fail = 0;
+            q.push(next);
+        }
+        else
+        {
+            nodes[0].next[b] = 0;
+        }
+    }
+
+    while (!q.empty())
+    {
+        int state = q.front();
+        q.pop();
+
+        for (int b = 0; b < 256; ++b)
+        {
+            int next = nodes[state].next[b];
+            if (next != -1)
+            {
+                int fail = nodes[state].fail;
+                nodes[next].fail = nodes[fail].next[b];
+
+                const auto& failOutputs = nodes[nodes[next].fail].outputs;
+                nodes[next].outputs.insert(nodes[next].outputs.end(), failOutputs.begin(), failOutputs.end());
+
+                q.push(next);
+            }
+            else
+            {
+                nodes[state].next[b] = nodes[nodes[state].fail].next[b];
+            }
+        }
+    }
+
+    return nodes;
+}
+
+int PrepareScanSnapshot(AvDatabaseSnapshot& snapshot, std::wstring& message)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        if (!g_app.authenticated)
+        {
+            message = L"Пользователь не авторизован";
+            return RPC_APP_NOT_AUTHENTICATED;
+        }
+
+        if (!g_app.licenseActive)
+        {
+            message = g_app.licenseMessage.empty() ? L"Нет активной лицензии" : g_app.licenseMessage;
+            return g_app.licenseStatusCode == RPC_APP_OK ? RPC_APP_NO_LICENSE : g_app.licenseStatusCode;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_avDb.mutex);
+        if (!g_avDb.loaded)
+        {
+            message = g_avDb.message.empty() ? L"Антивирусные базы не загружены" : g_avDb.message;
+            return RPC_APP_AV_DATABASE_NOT_LOADED;
+        }
+
+        snapshot.records = g_avDb.records;
+    }
+
+    snapshot.ahoNodes = BuildAhoAutomaton(snapshot.records);
+    return RPC_APP_OK;
+}
+
+struct FileScanOutcome
+{
+    int statusCode = RPC_APP_OK;
+    bool scanned = false;
+    bool infected = false;
+    std::wstring objectPath;
+    std::wstring threatName;
+    std::wstring message;
+};
+
+bool ScanStream(std::istream& stream, AvObjectType objectType, const AvDatabaseSnapshot& db, std::wstring& threatName)
+{
+    constexpr unsigned int kPrefixLength = 8;
+    constexpr unsigned int kMaxSignatureRemainderRead = 16 * 1024 * 1024;
+
+    if (objectType == AvObjectType::Unknown || db.records.empty() || db.ahoNodes.empty())
+        return false;
+
+    int state = 0;
+    unsigned long long position = 0;
+    char ch = 0;
+
+    stream.clear();
+    stream.seekg(0, std::ios::beg);
+
+    while (stream.read(&ch, 1))
+    {
+        BYTE b = static_cast<BYTE>(ch);
+        state = db.ahoNodes[state].next[b];
+
+        if (!db.ahoNodes[state].outputs.empty() && position + 1 >= kPrefixLength)
+        {
+            unsigned long long offset = position + 1 - kPrefixLength;
+            std::streampos savedPos = stream.tellg();
+
+            for (unsigned long long prefix : db.ahoNodes[state].outputs)
+            {
+                auto it = db.records.find(prefix);
+                if (it == db.records.end())
+                    continue;
+
+                std::array<BYTE, kPrefixLength> prefixBytes = BytesFromPrefix(prefix);
+                for (const AvSignatureRecord& record : it->second)
+                {
+                    if (record.objectType != objectType)
+                        continue;
+
+                    if (offset < record.offsetBegin || offset > record.offsetEnd)
+                        continue;
+
+                    if (record.objectSignatureLength < kPrefixLength)
+                        continue;
+
+                    unsigned int remainderLength = record.objectSignatureLength - kPrefixLength;
+                    if (remainderLength > kMaxSignatureRemainderRead)
+                        continue;
+
+                    std::vector<BYTE> remainder(remainderLength);
+                    if (remainderLength > 0)
+                    {
+                        stream.clear();
+                        stream.seekg(static_cast<std::streamoff>(offset + kPrefixLength), std::ios::beg);
+                        if (!stream) continue;
+
+                        stream.read(reinterpret_cast<char*>(remainder.data()), remainder.size());
+                        if (stream.gcount() != static_cast<std::streamsize>(remainder.size()))
+                            continue;
+                    }
+
+                    if (SignatureHashMatches(prefixBytes.data(), remainder, record.objectSignature))
+                    {
+                        threatName = record.threatName.empty() ? L"Unknown threat" : record.threatName;
+                        return true;
+                    }
+                }
+            }
+
+            stream.clear();
+            stream.seekg(savedPos, std::ios::beg);
+        }
+
+        ++position;
+    }
+
+    return false;
+}
+
+FileScanOutcome ScanFileInternal(const std::filesystem::path& path, const AvDatabaseSnapshot& db)
+{
+    FileScanOutcome outcome;
+    outcome.objectPath = path.wstring();
+
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec))
+    {
+        outcome.statusCode = RPC_APP_SCAN_ERROR;
+        outcome.message = L"Файл не найден или не является обычным файлом";
+        return outcome;
+    }
+
+    AvObjectType objectType = DetectObjectType(path);
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        outcome.statusCode = RPC_APP_SCAN_ERROR;
+        outcome.message = L"Не удалось открыть файл для чтения";
+        return outcome;
+    }
+
+    outcome.scanned = true;
+    outcome.infected = ScanStream(file, objectType, db, outcome.threatName);
+    outcome.message = outcome.infected
+        ? L"Обнаружена угроза: " + outcome.threatName
+        : L"Угроз не найдено";
+    return outcome;
+}
+
+void AppendReportLine(std::wstring& report, const std::wstring& line)
+{
+    constexpr size_t kMaxReportChars = 12000;
+    if (report.size() >= kMaxReportChars)
+        return;
+
+    if (report.size() + line.size() + 2 > kMaxReportChars)
+    {
+        report += L"... отчет обрезан\r\n";
+        return;
+    }
+
+    report += line;
+    report += L"\r\n";
+}
+
+std::wstring NowTimestamp()
+{
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t buf[32]{};
+    swprintf_s(buf, L"%04u-%02u-%02u %02u:%02u:%02u",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
+struct AggregateScanOutcome
+{
+    int statusCode = RPC_APP_OK;
+    bool infected = false;
+    int scannedFiles = 0;
+    int threatsFound = 0;
+    std::wstring objectPath;
+    std::wstring threatName;
+    std::wstring message;
+};
+
+AggregateScanOutcome AggregateFromFileOutcome(const FileScanOutcome& file)
+{
+    AggregateScanOutcome result;
+    result.statusCode = file.statusCode;
+    result.infected = file.infected;
+    result.scannedFiles = file.scanned ? 1 : 0;
+    result.threatsFound = file.infected ? 1 : 0;
+    result.objectPath = file.objectPath;
+    result.threatName = file.threatName;
+    result.message = file.message;
+    return result;
+}
+
+AggregateScanOutcome ScanDirectoryTreeInternal(const std::filesystem::path& root, const AvDatabaseSnapshot& db)
+{
+    AggregateScanOutcome result;
+    result.objectPath = root.wstring();
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec))
+    {
+        result.statusCode = RPC_APP_SCAN_ERROR;
+        result.message = L"Папка не найдена или недоступна";
+        return result;
+    }
+
+    std::wstring report;
+    std::filesystem::recursive_directory_iterator it(
+        root,
+        std::filesystem::directory_options::skip_permission_denied,
+        ec);
+    std::filesystem::recursive_directory_iterator end;
+
+    if (ec)
+    {
+        result.statusCode = RPC_APP_SCAN_ERROR;
+        result.message = L"Не удалось начать обход папки";
+        return result;
+    }
+
+    while (it != end)
+    {
+        std::error_code fileEc;
+        bool regular = it->is_regular_file(fileEc);
+        if (!fileEc && regular)
+        {
+            FileScanOutcome outcome = ScanFileInternal(it->path(), db);
+            if (outcome.scanned)
+                ++result.scannedFiles;
+
+            if (outcome.infected)
+            {
+                ++result.threatsFound;
+                result.infected = true;
+                if (result.threatName.empty()) result.threatName = outcome.threatName;
+                AppendReportLine(report, L"[УГРОЗА] " + outcome.objectPath + L" - " + outcome.threatName);
+            }
+            else if (outcome.statusCode != RPC_APP_OK)
+            {
+                AppendReportLine(report, L"[ПРОПУЩЕН] " + outcome.objectPath + L" - " + outcome.message);
+            }
+        }
+
+        it.increment(ec);
+        if (ec) ec.clear();
+    }
+
+    std::wstringstream summary;
+    summary << L"Проверено файлов: " << result.scannedFiles << L". Найдено угроз: " << result.threatsFound << L".";
+    if (!report.empty())
+    {
+        summary << L"\r\n\r\n" << report;
+    }
+    else if (result.threatsFound == 0)
+    {
+        summary << L"\r\nУгроз не найдено.";
+    }
+
+    result.message = summary.str();
+    return result;
+}
+
+AggregateScanOutcome ScanFixedDrivesInternal(const AvDatabaseSnapshot& db)
+{
+    AggregateScanOutcome result;
+    result.objectPath = L"Все несъемные диски";
+
+    DWORD required = GetLogicalDriveStringsW(0, nullptr);
+    if (required == 0)
+    {
+        result.statusCode = RPC_APP_SCAN_ERROR;
+        result.message = L"Не удалось получить список дисков";
+        return result;
+    }
+
+    std::vector<wchar_t> buffer(required + 2);
+    if (GetLogicalDriveStringsW(static_cast<DWORD>(buffer.size()), buffer.data()) == 0)
+    {
+        result.statusCode = RPC_APP_SCAN_ERROR;
+        result.message = L"Не удалось получить список дисков";
+        return result;
+    }
+
+    int fixedDriveCount = 0;
+    std::wstring report;
+    for (const wchar_t* drive = buffer.data(); *drive; drive += wcslen(drive) + 1)
+    {
+        if (GetDriveTypeW(drive) != DRIVE_FIXED)
+            continue;
+
+        ++fixedDriveCount;
+        AggregateScanOutcome driveResult = ScanDirectoryTreeInternal(std::filesystem::path(drive), db);
+        result.scannedFiles += driveResult.scannedFiles;
+        result.threatsFound += driveResult.threatsFound;
+        result.infected = result.infected || driveResult.infected;
+        if (result.threatName.empty()) result.threatName = driveResult.threatName;
+
+        std::wstringstream line;
+        line << L"Диск " << drive << L": проверено " << driveResult.scannedFiles
+            << L", угроз " << driveResult.threatsFound;
+        AppendReportLine(report, line.str());
+        if (driveResult.infected)
+            AppendReportLine(report, driveResult.message);
+    }
+
+    if (fixedDriveCount == 0)
+    {
+        result.statusCode = RPC_APP_SCAN_ERROR;
+        result.message = L"Несъемные диски не найдены";
+        return result;
+    }
+
+    std::wstringstream summary;
+    summary << L"Проверено несъемных дисков: " << fixedDriveCount
+        << L". Проверено файлов: " << result.scannedFiles
+        << L". Найдено угроз: " << result.threatsFound << L".";
+    if (!report.empty())
+        summary << L"\r\n\r\n" << report;
+
+    result.message = summary.str();
+    return result;
+}
+
+AggregateScanOutcome ScanConfiguredTarget(bool scanFixedDrives, const std::wstring& path)
+{
+    std::wstring readyMessage;
+    AvDatabaseSnapshot snapshot;
+    int ready = PrepareScanSnapshot(snapshot, readyMessage);
+    if (ready != RPC_APP_OK)
+    {
+        AggregateScanOutcome error;
+        error.statusCode = ready;
+        error.objectPath = scanFixedDrives ? L"Все несъемные диски" : path;
+        error.message = readyMessage;
+        return error;
+    }
+
+    if (scanFixedDrives)
+        return ScanFixedDrivesInternal(snapshot);
+
+    std::filesystem::path fsPath(path);
+    std::error_code ec;
+    if (std::filesystem::is_directory(fsPath, ec))
+        return ScanDirectoryTreeInternal(fsPath, snapshot);
+
+    return AggregateFromFileOutcome(ScanFileInternal(fsPath, snapshot));
+}
+
+void FillScanResult(RpcScanResult* result, int statusCode, bool infected, int scannedFiles, int threatsFound,
+    const std::wstring& objectPath, const std::wstring& threatName, const std::wstring& message)
+{
+    if (!result) return;
+
+    result->statusCode = statusCode;
+    result->infected = infected ? 1 : 0;
+    result->scannedFiles = scannedFiles;
+    result->threatsFound = threatsFound;
+    result->objectPath = RpcAllocString(objectPath);
+    result->threatName = RpcAllocString(threatName);
+    result->message = RpcAllocString(message);
+}
+
+void FillScanResult(RpcScanResult* result, const AggregateScanOutcome& scan)
+{
+    FillScanResult(
+        result,
+        scan.statusCode,
+        scan.infected,
+        scan.scannedFiles,
+        scan.threatsFound,
+        scan.objectPath,
+        scan.threatName,
+        scan.message);
+}
+
+struct ScheduledScanState
+{
+    std::mutex mutex;
+    bool enabled = false;
+    int intervalMinutes = 60;
+    bool scanFixedDrives = false;
+    std::wstring path;
+    unsigned long long generation = 0;
+    std::wstring lastRunTime;
+    int lastStatusCode = RPC_APP_OK;
+    int lastScannedFiles = 0;
+    int lastThreatsFound = 0;
+    std::wstring lastMessage = L"Сканирование по расписанию не выполнялось";
+};
+
+struct DirectoryMonitorState
+{
+    std::mutex mutex;
+    bool enabled = false;
+    std::wstring path;
+    unsigned long long generation = 0;
+    std::wstring lastEventTime;
+    int lastStatusCode = RPC_APP_OK;
+    int lastScannedFiles = 0;
+    int lastThreatsFound = 0;
+    std::wstring lastMessage = L"Мониторинг не выполнялся";
+};
+
+ScheduledScanState g_schedule;
+DirectoryMonitorState g_monitor;
+
+void StoreScheduledScanResult(const AggregateScanOutcome& scan)
+{
+    std::lock_guard<std::mutex> lock(g_schedule.mutex);
+    g_schedule.lastRunTime = NowTimestamp();
+    g_schedule.lastStatusCode = scan.statusCode;
+    g_schedule.lastScannedFiles = scan.scannedFiles;
+    g_schedule.lastThreatsFound = scan.threatsFound;
+    g_schedule.lastMessage = scan.message;
+}
+
+void StoreMonitorScanResult(const AggregateScanOutcome& scan)
+{
+    std::lock_guard<std::mutex> lock(g_monitor.mutex);
+    g_monitor.lastEventTime = NowTimestamp();
+    g_monitor.lastStatusCode = scan.statusCode;
+    g_monitor.lastScannedFiles = scan.scannedFiles;
+    g_monitor.lastThreatsFound = scan.threatsFound;
+    g_monitor.lastMessage = scan.message;
+}
+
+void StartScheduledScanWorker(unsigned long long generation)
+{
+    std::thread([generation]()
+        {
+            while (!g_serviceStopping.load())
+            {
+                int waitSeconds = 60;
+                {
+                    std::lock_guard<std::mutex> lock(g_schedule.mutex);
+                    if (!g_schedule.enabled || g_schedule.generation != generation)
+                        return;
+                    waitSeconds = max(1, g_schedule.intervalMinutes) * 60;
+                }
+
+                for (int i = 0; i < waitSeconds && !g_serviceStopping.load(); ++i)
+                {
+                    Sleep(1000);
+                    std::lock_guard<std::mutex> lock(g_schedule.mutex);
+                    if (!g_schedule.enabled || g_schedule.generation != generation)
+                        return;
+                }
+
+                bool scanFixedDrives = false;
+                std::wstring path;
+                {
+                    std::lock_guard<std::mutex> lock(g_schedule.mutex);
+                    if (!g_schedule.enabled || g_schedule.generation != generation)
+                        return;
+                    scanFixedDrives = g_schedule.scanFixedDrives;
+                    path = g_schedule.path;
+                }
+
+                StoreScheduledScanResult(ScanConfiguredTarget(scanFixedDrives, path));
+            }
+        }).detach();
+}
+
+void StartDirectoryMonitorWorker(unsigned long long generation)
+{
+    std::thread([generation]()
+        {
+            std::wstring path;
+            {
+                std::lock_guard<std::mutex> lock(g_monitor.mutex);
+                if (!g_monitor.enabled || g_monitor.generation != generation)
+                    return;
+                path = g_monitor.path;
+            }
+
+            HANDLE hChange = FindFirstChangeNotificationW(
+                path.c_str(),
+                TRUE,
+                FILE_NOTIFY_CHANGE_FILE_NAME |
+                FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_SIZE |
+                FILE_NOTIFY_CHANGE_LAST_WRITE);
+
+            if (hChange == INVALID_HANDLE_VALUE)
+            {
+                AggregateScanOutcome error;
+                error.statusCode = RPC_APP_SCAN_ERROR;
+                error.objectPath = path;
+                error.message = L"Не удалось запустить мониторинг папки";
+                StoreMonitorScanResult(error);
+                return;
+            }
+
+            while (!g_serviceStopping.load())
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_monitor.mutex);
+                    if (!g_monitor.enabled || g_monitor.generation != generation)
+                        break;
+                }
+
+                DWORD wait = WaitForSingleObject(hChange, 2000);
+                if (wait == WAIT_OBJECT_0)
+                {
+                    StoreMonitorScanResult(ScanConfiguredTarget(false, path));
+                    if (!FindNextChangeNotification(hChange))
+                        break;
+                }
+                else if (wait != WAIT_TIMEOUT)
+                {
+                    break;
+                }
+            }
+
+            FindCloseChangeNotification(hChange);
+        }).detach();
 }
 
 void ClearLicenseLocked()
@@ -1009,7 +2098,10 @@ int Login(handle_t, wchar_t* username, wchar_t* password, wchar_t** errorMessage
         licGen = g_app.licenseGeneration;
     }
     if (licenseCode == RPC_APP_OK)
+    {
         StartLicenseRefreshWorker(licGen);
+        LoadAvDatabaseFromServer();
+    }
 
     if (errorMessage) *errorMessage = RpcAllocString(L"");
     return RPC_APP_OK;
@@ -1017,8 +2109,11 @@ int Login(handle_t, wchar_t* username, wchar_t* password, wchar_t** errorMessage
 
 void Logout(handle_t)
 {
-    std::lock_guard<std::mutex> lock(g_app.mutex);
-    ClearAuthLocked();
+    {
+        std::lock_guard<std::mutex> lock(g_app.mutex);
+        ClearAuthLocked();
+    }
+    SetAvDatabaseStatus(false, 0, RPC_APP_AV_DATABASE_NOT_LOADED, L"Антивирусные базы не загружены");
 }
 
 void GetLicenseInfo(handle_t, RpcLicenseInfo* info)
@@ -1086,7 +2181,10 @@ int ActivateLicense(handle_t, wchar_t* activationKey, wchar_t** errorMessage)
             generation = g_app.licenseGeneration;
         }
         if (code == RPC_APP_OK)
+        {
             StartLicenseRefreshWorker(generation);
+            LoadAvDatabaseFromServer();
+        }
         if (errorMessage) *errorMessage = RpcAllocString(L"");
         return code;
     }
@@ -1109,6 +2207,240 @@ int ActivateLicense(handle_t, wchar_t* activationKey, wchar_t** errorMessage)
 
     if (errorMessage) *errorMessage = RpcAllocString(message);
     return code;
+}
+
+void GetAvDatabaseInfo(handle_t, RpcAvDatabaseInfo* info)
+{
+    if (!info) return;
+
+    std::lock_guard<std::mutex> lock(g_avDb.mutex);
+    info->loaded = g_avDb.loaded ? 1 : 0;
+    info->recordCount = g_avDb.recordCount;
+    info->releaseDate = RpcAllocString(g_avDb.releaseDate);
+    info->statusCode = g_avDb.statusCode;
+    info->message = RpcAllocString(g_avDb.message);
+}
+
+int ScanFile(handle_t, wchar_t* path, RpcScanResult* result)
+{
+    std::wstring wPath = RpcStringOrEmpty(path);
+    std::wstring message;
+    AvDatabaseSnapshot snapshot;
+
+    int ready = PrepareScanSnapshot(snapshot, message);
+    if (ready != RPC_APP_OK)
+    {
+        FillScanResult(result, ready, false, 0, 0, wPath, L"", message);
+        return ready;
+    }
+
+    FileScanOutcome outcome = ScanFileInternal(std::filesystem::path(wPath), snapshot);
+    FillScanResult(
+        result,
+        outcome.statusCode,
+        outcome.infected,
+        outcome.scanned ? 1 : 0,
+        outcome.infected ? 1 : 0,
+        outcome.objectPath,
+        outcome.threatName,
+        outcome.message);
+
+    return outcome.statusCode;
+}
+
+int ScanDirectory(handle_t, wchar_t* path, RpcScanResult* result)
+{
+    std::wstring wPath = RpcStringOrEmpty(path);
+    AggregateScanOutcome scan = ScanConfiguredTarget(false, wPath);
+    FillScanResult(result, scan);
+    return scan.statusCode;
+
+    std::wstring message;
+    AvDatabaseSnapshot snapshot;
+
+    int ready = PrepareScanSnapshot(snapshot, message);
+    if (ready != RPC_APP_OK)
+    {
+        FillScanResult(result, ready, false, 0, 0, wPath, L"", message);
+        return ready;
+    }
+
+    std::filesystem::path root(wPath);
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec))
+    {
+        FillScanResult(result, RPC_APP_SCAN_ERROR, false, 0, 0, wPath, L"", L"Папка не найдена или недоступна");
+        return RPC_APP_SCAN_ERROR;
+    }
+
+    int scannedFiles = 0;
+    int threatsFound = 0;
+    std::wstring firstThreat;
+    std::wstring report;
+
+    std::filesystem::recursive_directory_iterator it(
+        root,
+        std::filesystem::directory_options::skip_permission_denied,
+        ec);
+    std::filesystem::recursive_directory_iterator end;
+
+    if (ec)
+    {
+        FillScanResult(result, RPC_APP_SCAN_ERROR, false, 0, 0, wPath, L"", L"Не удалось начать обход папки");
+        return RPC_APP_SCAN_ERROR;
+    }
+
+    while (it != end)
+    {
+        std::error_code fileEc;
+        bool regular = it->is_regular_file(fileEc);
+        if (!fileEc && regular)
+        {
+            FileScanOutcome outcome = ScanFileInternal(it->path(), snapshot);
+            if (outcome.scanned)
+                ++scannedFiles;
+
+            if (outcome.infected)
+            {
+                ++threatsFound;
+                if (firstThreat.empty()) firstThreat = outcome.threatName;
+                AppendReportLine(report, L"[УГРОЗА] " + outcome.objectPath + L" - " + outcome.threatName);
+            }
+            else if (outcome.statusCode != RPC_APP_OK)
+            {
+                AppendReportLine(report, L"[ПРОПУЩЕН] " + outcome.objectPath + L" - " + outcome.message);
+            }
+        }
+
+        it.increment(ec);
+        if (ec) ec.clear();
+    }
+
+    std::wstringstream summary;
+    summary << L"Проверено файлов: " << scannedFiles << L". Найдено угроз: " << threatsFound << L".";
+    if (!report.empty())
+    {
+        summary << L"\r\n\r\n" << report;
+    }
+    else if (threatsFound == 0)
+    {
+        summary << L"\r\nУгроз не найдено.";
+    }
+
+    FillScanResult(
+        result,
+        RPC_APP_OK,
+        threatsFound > 0,
+        scannedFiles,
+        threatsFound,
+        wPath,
+        firstThreat,
+        summary.str());
+
+    return RPC_APP_OK;
+}
+
+int ScanFixedDrives(handle_t, RpcScanResult* result)
+{
+    AggregateScanOutcome scan = ScanConfiguredTarget(true, L"");
+    FillScanResult(result, scan);
+    return scan.statusCode;
+}
+
+int ConfigureScheduledScan(handle_t, int enabled, int intervalMinutes, int scanFixedDrives, wchar_t* path)
+{
+    std::wstring wPath = RpcStringOrEmpty(path);
+
+    if (enabled)
+    {
+        if (intervalMinutes < 1) intervalMinutes = 1;
+        if (!scanFixedDrives)
+        {
+            std::error_code ec;
+            std::filesystem::path fsPath(wPath);
+            if (wPath.empty() || (!std::filesystem::is_directory(fsPath, ec) &&
+                !std::filesystem::is_regular_file(fsPath, ec)))
+            {
+                return RPC_APP_SCAN_ERROR;
+            }
+        }
+    }
+
+    unsigned long long generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_schedule.mutex);
+        g_schedule.enabled = enabled != 0;
+        g_schedule.intervalMinutes = intervalMinutes < 1 ? 1 : intervalMinutes;
+        g_schedule.scanFixedDrives = scanFixedDrives != 0;
+        g_schedule.path = wPath;
+        g_schedule.lastMessage = g_schedule.enabled
+            ? L"Сканирование по расписанию настроено"
+            : L"Сканирование по расписанию отключено";
+        generation = ++g_schedule.generation;
+    }
+
+    if (enabled)
+        StartScheduledScanWorker(generation);
+
+    return RPC_APP_OK;
+}
+
+void GetScheduledScanInfo(handle_t, RpcScheduledScanInfo* info)
+{
+    if (!info) return;
+
+    std::lock_guard<std::mutex> lock(g_schedule.mutex);
+    info->enabled = g_schedule.enabled ? 1 : 0;
+    info->intervalMinutes = g_schedule.intervalMinutes;
+    info->scanFixedDrives = g_schedule.scanFixedDrives ? 1 : 0;
+    info->path = RpcAllocString(g_schedule.path);
+    info->lastRunTime = RpcAllocString(g_schedule.lastRunTime);
+    info->lastStatusCode = g_schedule.lastStatusCode;
+    info->lastScannedFiles = g_schedule.lastScannedFiles;
+    info->lastThreatsFound = g_schedule.lastThreatsFound;
+    info->lastMessage = RpcAllocString(g_schedule.lastMessage);
+}
+
+int ConfigureDirectoryMonitor(handle_t, int enabled, wchar_t* path)
+{
+    std::wstring wPath = RpcStringOrEmpty(path);
+
+    if (enabled)
+    {
+        std::error_code ec;
+        if (wPath.empty() || !std::filesystem::is_directory(std::filesystem::path(wPath), ec))
+            return RPC_APP_SCAN_ERROR;
+    }
+
+    unsigned long long generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_monitor.mutex);
+        g_monitor.enabled = enabled != 0;
+        g_monitor.path = wPath;
+        g_monitor.lastMessage = g_monitor.enabled
+            ? L"Мониторинг папки включен"
+            : L"Мониторинг папки отключен";
+        generation = ++g_monitor.generation;
+    }
+
+    if (enabled)
+        StartDirectoryMonitorWorker(generation);
+
+    return RPC_APP_OK;
+}
+
+void GetDirectoryMonitorInfo(handle_t, RpcDirectoryMonitorInfo* info)
+{
+    if (!info) return;
+
+    std::lock_guard<std::mutex> lock(g_monitor.mutex);
+    info->enabled = g_monitor.enabled ? 1 : 0;
+    info->path = RpcAllocString(g_monitor.path);
+    info->lastEventTime = RpcAllocString(g_monitor.lastEventTime);
+    info->lastStatusCode = g_monitor.lastStatusCode;
+    info->lastScannedFiles = g_monitor.lastScannedFiles;
+    info->lastThreatsFound = g_monitor.lastThreatsFound;
+    info->lastMessage = RpcAllocString(g_monitor.lastMessage);
 }
 
 bool StartRpcServer()
